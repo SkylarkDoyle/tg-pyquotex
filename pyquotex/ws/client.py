@@ -24,6 +24,9 @@ class WebsocketClient(object):
             "Host": f"ws2.{self.api.host}",
         }
 
+        # Build cookie string from session data for Cloudflare bypass
+        cookie_str = self.api.session_data.get("cookies") or ""
+
         websocket.enableTrace(self.api.trace_ws)
         self.wss = websocket.WebSocketApp(
             self.api.wss_url,
@@ -34,7 +37,7 @@ class WebsocketClient(object):
             on_ping=self.on_ping,
             on_pong=self.on_pong,
             header=self.headers,
-            # cookie=self.api.cookies
+            cookie=cookie_str,
         )
 
     def on_message(self, wss, message):

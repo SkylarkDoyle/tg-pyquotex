@@ -71,6 +71,7 @@ class Quotex:
         self.websocket_client = None
         self.websocket_thread = None
         self.debug_ws_enable = False
+        self.browser_page = None  # Playwright page for browser WS (Cloudflare bypass)
         self.resource_path = resource_path(root_path)
         session = load_session(user_agent)
         self.session_data = session
@@ -86,10 +87,11 @@ class Quotex:
 
     @staticmethod
     async def check_connect():
+        if global_value.check_accepted_connection == 1:
+            return True
         await asyncio.sleep(2)
         if global_value.check_accepted_connection == 1:
             return True
-
         return False
 
     def set_session(self, user_agent: str, cookies: str = None, ssid: str = None):
@@ -99,6 +101,14 @@ class Quotex:
             "user_agent": user_agent
         }
         self.session_data = update_session(session)
+
+    def set_browser_page(self, page):
+        """Set a Playwright page for browser-based WebSocket (Cloudflare bypass).
+
+        When set, connect() will route the websocket through the browser
+        instead of using Python's websocket-client.
+        """
+        self.browser_page = page
 
     async def re_subscribe_stream(self):
         try:
@@ -230,10 +240,16 @@ class Quotex:
         self.api.current_period = self.period_default
         global_value.SSID = self.session_data.get("token")
 
-        if not self.session_data.get("token"):
+        if self.browser_page:
+            # Browser mode: skip HTTP auth, use browser websocket
+            logger.info("Using browser WebSocket (Cloudflare bypass mode)")
+        elif not self.session_data.get("token"):
             await self.api.authenticate()
 
-        check, reason = await self.api.connect(self.account_is_demo)
+        check, reason = await self.api.connect(
+            self.account_is_demo,
+            browser_page=self.browser_page
+        )
 
         if not await self.check_connect():
             logger.debug("Reconnecting on websocket")
@@ -587,8 +603,20 @@ class Quotex:
         return await self.api.get_profile()
 
     async def get_server_time(self):
-        user_settings = await self.get_profile()
-        offset_zone = user_settings.offset
+        # In browser mode, avoid the slow synchronous HTTP request
+        if self.browser_page:
+            try:
+                # Get the timezone offset instantly from the page JS
+                offset_zone = int(await self.browser_page.evaluate("""() => {
+                    const s = window.settings || {};
+                    return s.timeOffset || 0;
+                }"""))
+            except:
+                offset_zone = 0
+        else:
+            user_settings = await self.get_profile()
+            offset_zone = user_settings.offset
+
         self.api.timesync.server_timestamp = expiration.get_server_timer(offset_zone)
         return self.api.timesync.server_timestamp
 

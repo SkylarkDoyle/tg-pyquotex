@@ -26,6 +26,7 @@ from .ws.objects.candles import Candles
 from .ws.objects.profile import Profile
 from .ws.objects.listinfodata import ListInfoData
 from .ws.client import WebsocketClient
+from .ws.browser_client import BrowserWebsocketClient
 from collections import defaultdict
 
 urllib3.disable_warnings()
@@ -97,6 +98,7 @@ class QuotexAPI(object):
         self.wss_message = None
         self.websocket_thread = None
         self.websocket_client = None
+        self.browser_ws_client = None
         self.set_ssid = None
         self.object_id = None
         self.token_login2fa = None
@@ -129,6 +131,8 @@ class QuotexAPI(object):
 
         :returns: The instance of :class:`WebSocket <websocket.WebSocket>`.
         """
+        if self.browser_ws_client:
+            return None  # Browser mode doesn't use websocket-client
         return self.websocket_client.wss
 
     def subscribe_realtime_candle(self, asset, period):
@@ -428,7 +432,18 @@ class QuotexAPI(object):
                or global_value.ssl_Mutual_exclusion_write) and no_force_send:
             pass
         global_value.ssl_Mutual_exclusion_write = True
-        self.websocket.send(data)
+        if self.browser_ws_client:
+            # Browser mode: async send via Playwright
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    asyncio.ensure_future(self.browser_ws_client.send(data))
+                else:
+                    loop.run_until_complete(self.browser_ws_client.send(data))
+            except Exception as e:
+                logger.error("Browser WS send error: %s", e)
+        else:
+            self.websocket.send(data)
         logger.debug(data)
         global_value.ssl_Mutual_exclusion_write = False
 
@@ -493,6 +508,33 @@ class QuotexAPI(object):
                 global_value.SSID = None
                 logger.debug("Websocket Token Rejected.")
                 return True, "Websocket Token Rejected."
+    async def start_websocket_browser(self, page):
+        """Start websocket via Playwright browser (Cloudflare bypass)."""
+        global_value.check_websocket_if_connect = None
+        global_value.check_websocket_if_error = False
+        global_value.websocket_error_reason = None
+        if not global_value.SSID:
+            logger.error("No SSID token available for browser websocket.")
+            return False, "No SSID token"
+
+        self.browser_ws_client = BrowserWebsocketClient(self, page)
+        await self.browser_ws_client.start()
+
+        # Wait for connection result
+        for _ in range(100):  # 10 seconds max
+            if global_value.check_websocket_if_error:
+                return False, global_value.websocket_error_reason
+            elif global_value.check_websocket_if_connect == 0:
+                return False, "Browser websocket closed."
+            elif global_value.check_websocket_if_connect == 1:
+                logger.debug("Browser websocket connected successfully!")
+                return True, "Browser websocket connected!"
+            elif global_value.check_rejected_connection == 1:
+                global_value.SSID = None
+                return True, "Websocket Token Rejected."
+            await asyncio.sleep(0.1)
+
+        return False, "Browser websocket connection timeout."
 
     def send_ssid(self, timeout=10):
         self.wss_message = None
@@ -509,7 +551,7 @@ class QuotexAPI(object):
 
         return True
 
-    async def connect(self, is_demo):
+    async def connect(self, is_demo, browser_page=None):
         """Method for connection to Quotex API."""
         self.account_type = is_demo
         global_value.ssl_Mutual_exclusion = False
@@ -518,16 +560,25 @@ class QuotexAPI(object):
             logger.info("Closing websocket connection...")
             await self.close()
 
-        check_websocket, websocket_reason = await self.start_websocket()
+        if browser_page:
+            # Use Playwright browser websocket (bypasses Cloudflare)
+            check_websocket, websocket_reason = await self.start_websocket_browser(browser_page)
+        else:
+            check_websocket, websocket_reason = await self.start_websocket()
 
         if not check_websocket:
             return check_websocket, websocket_reason
-        check_ssid = self.send_ssid()
 
-        if not check_ssid:
-            await self.authenticate()
-            if self.is_logged:
-                self.send_ssid()
+        if browser_page:
+            # Browser mode: page's JS already authenticated on the WS.
+            # Just give it a moment to process the auth response frames.
+            await asyncio.sleep(1)
+        else:
+            check_ssid = self.send_ssid()
+            if not check_ssid:
+                await self.authenticate()
+                if self.is_logged:
+                    self.send_ssid()
 
         return check_websocket, websocket_reason
 
@@ -537,6 +588,10 @@ class QuotexAPI(object):
         await self.start_websocket()
 
     async def close(self):
+        if hasattr(self, 'browser_ws_client') and self.browser_ws_client:
+            await self.browser_ws_client.close()
+            self.browser_ws_client = None
+            return True
         if self.websocket_client:
             self.websocket.close()
             await asyncio.sleep(1)
@@ -544,4 +599,6 @@ class QuotexAPI(object):
         return True
 
     def websocket_alive(self):
+        if hasattr(self, 'browser_ws_client') and self.browser_ws_client:
+            return self.browser_ws_client._connected
         return self.websocket_thread.is_alive()
