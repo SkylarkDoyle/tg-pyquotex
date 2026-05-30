@@ -269,7 +269,13 @@ async def acquire_session_via_browser(headless: bool = False):
             channel="chrome",
             headless=headless,
             accept_downloads=False,
-            args=["--disable-blink-features=AutomationControlled"],
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-background-timer-throttling",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-renderer-backgrounding",
+                "--disable-dev-shm-usage"
+            ],
         )
 
         page = context.pages[0] if context.pages else await context.new_page()
@@ -401,10 +407,100 @@ async def connect_quotex_with_retry(client: Quotex, max_retries: int = MAX_CONNE
 # Trading
 # ---------------------------------------------------------------------------
 
+async def sniper_entry(
+    quotex_client: Quotex,
+    asset_name: str,
+    direction: str,
+    signal: PendingSignal,
+    wait_window: float = 20.0,
+    dip_percent: float = 0.00005 # 0.005% price difference
+) -> bool:
+    """
+    Watches real-time ticks for a better entry price.
+    For CALL: waits for a dip. For PUT: waits for a spike.
+    """
+    logger.info("Sniper mode: Waiting up to %ds for a better %s entry...", int(wait_window), direction.upper())
+    
+    # Subscribe to ensure we get realtime prices
+    quotex_client.start_candles_stream(asset_name, 60)
+    
+    start_time = time.time()
+    entry_price = None
+    target_price = None
+    
+    # Get initial ticks to find baseline
+    all_ticks = await quotex_client.get_realtime_price(asset_name)
+    start_idx = len(all_ticks)
+    
+    while time.time() - start_time < wait_window:
+        all_ticks = await quotex_client.get_realtime_price(asset_name)
+        new_ticks = all_ticks[start_idx:]
+        
+        if all_ticks and entry_price is None:
+            # Calculate the exact timestamp of the candle that completed BEFORE the direction was received
+            direction_time = int(start_time)  # start_time = time.time() when direction sticker arrived
+            current_candle_start = direction_time - (direction_time % 60)
+            target_candle_time = current_candle_start - 60
+            
+            # 1. Attempt to get the TRUE CLOSE price of that exact candle using historical data
+            try:
+                # Fetch enough history to ensure we get the target candle (300 seconds = 5 mins)
+                candles = await asyncio.wait_for(quotex_client.get_candles(asset_name, time.time(), 300, 60), timeout=3.0)
+                if candles:
+                    for c in candles:
+                        if c["time"] == target_candle_time:
+                            entry_price = float(c["close"])
+                            logger.info("Found exact signal reference candle (Time: %s) close price: %.5f", target_candle_time, entry_price)
+                            break
+                    
+                    # Fallback if the exact timestamp wasn't found in the array for some reason
+                    if entry_price is None and len(candles) >= 2:
+                        entry_price = float(candles[-2]["close"])
+                        logger.info("Target candle time not matched, falling back to previous candle close: %.5f", entry_price)
+            except Exception as e:
+                logger.warning("Failed to fetch historical candle close, falling back to ticks: %s", e)
+
+            # 2. Fallback if get_candles fails: try to find it in ticks, or just use the first tick we saw
+            if entry_price is None:
+                for tick in all_ticks:
+                    if tick["time"] >= current_candle_start:
+                        entry_price = tick["price"]
+                        break
+                if entry_price is None and new_ticks:
+                    entry_price = new_ticks[0]["price"]
+                
+            if entry_price is not None:
+                dip_amount = entry_price * dip_percent
+                if direction.lower() == "call":
+                    target_price = entry_price - dip_amount
+                else:
+                    target_price = entry_price + dip_amount
+                logger.info("Sniper baseline (True Open): %.5f | Target: %.5f", entry_price, target_price)
+                
+        if target_price is not None and new_ticks:
+            latest_price = new_ticks[-1]["price"]
+            
+            if direction.lower() == "call" and latest_price <= target_price:
+                logger.info("Sniper CALL triggered! Price dipped to %.5f", latest_price)
+                quotex_client.api.realtime_price[asset_name] = all_ticks[-10:]
+                return True
+            elif direction.lower() == "put" and latest_price >= target_price:
+                logger.info("Sniper PUT triggered! Price spiked to %.5f", latest_price)
+                quotex_client.api.realtime_price[asset_name] = all_ticks[-10:]
+                return True
+                
+        await asyncio.sleep(0.2)
+        
+    logger.warning("Sniper window expired. No better entry found. Skipping trade.")
+    if all_ticks:
+        quotex_client.api.realtime_price[asset_name] = all_ticks[-10:]
+    return False
+
+
 async def execute_trade(quotex_client: Quotex, signal: PendingSignal, direction: str):
     """Execute a trade on Quotex based on the parsed signal."""
     logger.info(
-        "EXECUTING TRADE: %s | %s | %ds | $%.2f",
+        "PREPARING TRADE: %s | %s | %ds | $%.2f",
         signal.asset, direction.upper(), signal.duration, TRADE_AMOUNT,
     )
 
@@ -428,6 +524,11 @@ async def execute_trade(quotex_client: Quotex, signal: PendingSignal, direction:
             return
 
         logger.info("Asset %s is open.", asset_name)
+
+        # --- Smart Sniper Entry ---
+        good_entry = await sniper_entry(quotex_client, asset_name, direction, signal, wait_window=20.0)
+        if not good_entry:
+            return
 
         # Place the trade
         status, buy_info = await quotex_client.buy(
@@ -486,7 +587,7 @@ async def main(headless: bool = False):
 
     # --- Telegram setup ---
     logger.info("Connecting to Telegram...")
-    tg_client = TelegramClient(SESSION_PATH, TELEGRAM_API_ID, TELEGRAM_API_HASH)
+    tg_client = TelegramClient(SESSION_PATH, TELEGRAM_API_ID, TELEGRAM_API_HASH, connection_retries=None, timeout=10, request_retries=5)
 
     await tg_client.start()
     logger.info("Connected to Telegram")
@@ -538,7 +639,8 @@ async def main(headless: bool = False):
                     "Direction detected: %s for pending signal %s",
                     direction.upper(), pending_signal,
                 )
-                await execute_trade(quotex_client, pending_signal, direction)
+                # Run the trade in the background so it doesn't block Telegram events
+                asyncio.create_task(execute_trade(quotex_client, pending_signal, direction))
                 pending_signal = None
                 return
 
@@ -584,10 +686,41 @@ async def main(headless: bool = False):
     logger.info("   Press Ctrl+C to stop.")
     logger.info("=" * 60)
 
+    # --- Active Connection Supervisors ---
+    async def telegram_supervisor():
+        """Keeps Telegram connection alive and forces a crash if it completely drops."""
+        while await tg_client.is_user_authorized():
+            try:
+                await asyncio.wait_for(tg_client.get_me(), timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.warning("Telegram ping timed out (silent drop suspected).")
+                # Telethon will attempt auto-reconnect, but if you want PM2 to handle it:
+                # raise ConnectionError("Telegram connection dead")
+            except Exception as e:
+                logger.warning("Telegram ping error: %s", e)
+            await asyncio.sleep(60)
+
+    async def quotex_supervisor():
+        """Keeps Quotex websocket alive."""
+        while True:
+            try:
+                if await quotex_client.check_connect():
+                    await asyncio.wait_for(quotex_client.get_balance(), timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.warning("Quotex ping timed out.")
+            except Exception as e:
+                logger.warning("Quotex ping error: %s", e)
+            await asyncio.sleep(60)
+
     try:
-        await tg_client.run_until_disconnected()
-    except Exception:
-        pass
+        # Run the supervisors and the passive listener concurrently
+        await asyncio.gather(
+            telegram_supervisor(),
+            quotex_supervisor(),
+            tg_client.run_until_disconnected()
+        )
+    except Exception as e:
+        logger.error("Main loop error: %s", e)
     finally:
         try:
             await tg_client.disconnect()

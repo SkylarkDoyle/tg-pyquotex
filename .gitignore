@@ -18,6 +18,7 @@ settings/config.ini
 
 # Telegram session files
 settings/*.session
+settings/*.session-journal
 
 # Session tokens
 session.json
