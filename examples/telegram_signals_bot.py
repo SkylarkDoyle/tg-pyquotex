@@ -53,7 +53,7 @@ TRADE_DURATION = config.getint("trading", "duration", fallback=60)
 ACCOUNT_MODE = config.get("trading", "account_mode", fallback="PRACTICE").upper()
 
 # How long (seconds) a pending signal stays valid before expiring
-SIGNAL_EXPIRY_SECONDS = 120
+SIGNAL_EXPIRY_SECONDS = 600
 
 # Quotex connection retry settings
 MAX_CONNECT_RETRIES = 5
@@ -412,8 +412,8 @@ async def sniper_entry(
     asset_name: str,
     direction: str,
     signal: PendingSignal,
-    wait_window: float = 20.0,
-    dip_percent: float = 0.00005 # 0.005% price difference
+    wait_window: float = 30.0,
+    tick_count: int = 2  # Number of ticks (pips) the price must move for a better entry
 ) -> bool:
     """
     Watches real-time ticks for a better entry price.
@@ -470,12 +470,14 @@ async def sniper_entry(
                     entry_price = new_ticks[0]["price"]
                 
             if entry_price is not None:
-                dip_amount = entry_price * dip_percent
+                # Auto-detect tick size: JPY pairs (price > 10) use 0.001, others use 0.00001
+                tick_size = 0.001 if entry_price > 10 else 0.00001
+                dip_amount = tick_count * tick_size
                 if direction.lower() == "call":
                     target_price = entry_price - dip_amount
                 else:
                     target_price = entry_price + dip_amount
-                logger.info("Sniper baseline (True Open): %.5f | Target: %.5f", entry_price, target_price)
+                logger.info("Sniper baseline: %.5f | Target: %.5f (tick_size=%.5f, ticks=%d)", entry_price, target_price, tick_size, tick_count)
                 
         if target_price is not None and new_ticks:
             latest_price = new_ticks[-1]["price"]
@@ -526,7 +528,7 @@ async def execute_trade(quotex_client: Quotex, signal: PendingSignal, direction:
         logger.info("Asset %s is open.", asset_name)
 
         # --- Smart Sniper Entry ---
-        good_entry = await sniper_entry(quotex_client, asset_name, direction, signal, wait_window=20.0)
+        good_entry = await sniper_entry(quotex_client, asset_name, direction, signal, wait_window=30.0)
         if not good_entry:
             return
 
